@@ -41,10 +41,10 @@ type Conn struct {
 
 type query struct {
 	mode
-	nm string
-	js *simplejson.Json
-	rt *request
-	pr *query
+	name   string
+	js     *simplejson.Json
+	req    *request
+	parent *query
 }
 
 type request struct {
@@ -59,7 +59,7 @@ type request struct {
 }
 
 type responce struct {
-	rt      *request
+	req     *request
 	session *string
 	total   int
 	len     int
@@ -101,10 +101,12 @@ type Bool interface {
 }
 
 type Range interface {
-	Gte(interface{}) Range
-	Lte(interface{}) Range
-	Qt(interface{}) Range
-	Lt(interface{}) Range
+	Gte(val interface{}) Range
+	Lte(val interface{}) Range
+	Qt(val interface{}) Range
+	Lt(val interface{}) Range
+	Format(format string) Range
+	TimeZone(val string) Range
 
 	Range(key string) Range
 	Bool() Bool
@@ -124,15 +126,16 @@ func Open(host string) *Conn {
 }
 
 func (c *Conn) newRequest(mtd method, act action) *request {
-	var rt request
-	rt.conn = c
-	rt.method = mtd
-	rt.action = act
-	rt.mode = _M_SINGLE
-	rt.index = []string{"_all"}
-	rt.js = simplejson.New()
-	rt.rt = &rt
-	return &rt
+	var req request
+	req.conn = c
+	req.method = mtd
+	req.action = act
+	req.mode = _M_SINGLE
+	req.index = []string{"_all"}
+	req.js = simplejson.New()
+	req.query.name = "root"
+	req.req = &req
+	return &req
 }
 
 func (c *Conn) indexAct(act action, val ...string) error {
@@ -179,18 +182,18 @@ func (r *Responce) Len() int {
 
 func (r *Responce) Next() bool {
 	for {
-		if r.resp.index < r.resp.len && (r.resp.rt.limit == 0 || r.resp.count < r.resp.rt.limit) {
+		if r.resp.index < r.resp.len && (r.resp.req.limit == 0 || r.resp.count < r.resp.req.limit) {
 			r.resp.curr = r.resp.hits.GetIndex(r.resp.index)
 			r.resp.index++
 			r.resp.count++
 			return true
 		}
 
-		if r.resp.session != nil && r.resp.count < r.resp.total && r.resp.count < r.resp.rt.limit {
-			rec := r.resp.rt.conn.newRequest(r.resp.rt.method, _ACT_SEARCH)
+		if r.resp.session != nil && r.resp.count < r.resp.total && r.resp.count < r.resp.req.limit {
+			rec := r.resp.req.conn.newRequest(r.resp.req.method, _ACT_SEARCH)
 			rec.isscroll = true
-			rec.limit = r.resp.rt.limit
-			rec.scroll = r.resp.rt.scroll
+			rec.limit = r.resp.req.limit
+			rec.scroll = r.resp.req.scroll
 
 			rec.js.Set("scroll", *rec.scroll)
 			rec.js.Set("scroll_id", *r.resp.session)
@@ -234,15 +237,15 @@ func (rt *request) Scroll(val string, limit int) RecGet {
 }
 
 func (q *query) Do() (*Responce, error) {
-	rt := q.rt
+	req := q.req
 	var url bytes.Buffer
-	url.WriteString(rt.conn.host)
-	if !rt.isscroll {
+	url.WriteString(req.conn.host)
+	if !req.isscroll {
 		url.WriteString("/")
-		url.WriteString(strings.Join(rt.index, ","))
+		url.WriteString(strings.Join(req.index, ","))
 	}
 
-	switch rt.action {
+	switch req.action {
 	case _ACT_SEARCH:
 		url.WriteString("/_search")
 	case _ACT_INDEX_OPEN:
@@ -251,26 +254,26 @@ func (q *query) Do() (*Responce, error) {
 		url.WriteString("/_close")
 	}
 
-	if rt.isscroll {
+	if req.isscroll {
 		url.WriteString("/scroll")
-	} else if rt.scroll != nil {
+	} else if req.scroll != nil {
 		url.WriteString("?scroll=")
-		url.WriteString(*rt.scroll)
+		url.WriteString(*req.scroll)
 	}
 
 	var body bytes.Buffer
-	if rt.action == _ACT_SEARCH {
+	if req.action == _ACT_SEARCH {
 		data, _ := q.js.Encode()
 		body.Write(data)
 	}
 
-	if rt.conn.outlog != nil {
-		fmt.Fprintln(rt.conn.outlog, url.String())
-		fmt.Fprintln(rt.conn.outlog, body.String())
+	if req.conn.outlog != nil {
+		fmt.Fprintln(req.conn.outlog, url.String())
+		fmt.Fprintln(req.conn.outlog, body.String())
 	}
 
 	var tp string
-	switch rt.method {
+	switch req.method {
 	case _REQ_POST:
 		tp = "POST"
 	default:
@@ -278,24 +281,24 @@ func (q *query) Do() (*Responce, error) {
 	}
 
 	cl := &http.Client{}
-	req, err := http.NewRequest(tp, url.String(), &body)
+	rhttp, err := http.NewRequest(tp, url.String(), &body)
 	if err != nil {
-		if rt.conn.errlog != nil {
-			fmt.Fprintln(rt.conn.outlog, err.Error())
+		if req.conn.errlog != nil {
+			fmt.Fprintln(req.conn.outlog, err.Error())
 		}
 		return nil, err
 	}
 
 	elps := time.Now()
-	res, err := cl.Do(req)
+	res, err := cl.Do(rhttp)
 
-	if rt.conn.outlog != nil {
-		fmt.Fprintln(rt.conn.outlog, "query time: ", time.Now().Sub(elps))
+	if req.conn.outlog != nil {
+		fmt.Fprintln(req.conn.outlog, "query time: ", time.Now().Sub(elps))
 	}
 
 	if err != nil {
-		if rt.conn.errlog != nil {
-			fmt.Fprintln(rt.conn.outlog, err.Error())
+		if req.conn.errlog != nil {
+			fmt.Fprintln(req.conn.outlog, err.Error())
 		}
 		return nil, err
 	}
@@ -303,25 +306,25 @@ func (q *query) Do() (*Responce, error) {
 
 	js, err := simplejson.NewFromReader(res.Body)
 	if err != nil {
-		if rt.conn.errlog != nil {
-			fmt.Fprintln(rt.conn.outlog, err.Error())
+		if req.conn.errlog != nil {
+			fmt.Fprintln(req.conn.outlog, err.Error())
 		}
 		return nil, err
 	}
 
-	if rt.conn.inlog != nil {
+	if req.conn.inlog != nil {
 		out, _ := js.EncodePretty()
-		fmt.Fprintln(rt.conn.inlog, string(out))
+		fmt.Fprintln(req.conn.inlog, string(out))
 	}
 
 	if str, err := js.GetPath("error", "reason").String(); err == nil {
-		if rt.conn.errlog != nil {
-			fmt.Fprintln(rt.conn.errlog, str)
+		if req.conn.errlog != nil {
+			fmt.Fprintln(req.conn.errlog, str)
 		}
 		return nil, errors.New(str)
 	}
 
-	out := &Responce{resp: &responce{rt: rt, total: js.GetPath("hits", "total").MustInt(), hits: js.GetPath("hits", "hits")}}
+	out := &Responce{resp: &responce{req: req, total: js.GetPath("hits", "total").MustInt(), hits: js.GetPath("hits", "hits")}}
 	out.resp.len = len(out.resp.hits.MustArray())
 
 	if id, err := js.Get("_scroll_id").String(); err == nil {
@@ -347,34 +350,34 @@ func (q *query) itemAdd(key string, js *simplejson.Json) {
 }
 
 func (q *query) itemMap(name string) *query {
-	item := query{js: simplejson.New(), mode: _M_SINGLE, nm: name, rt: q.rt, pr: q}
+	item := query{js: simplejson.New(), mode: _M_SINGLE, name: name, req: q.req, parent: q}
 	q.itemAdd(name, item.js)
 	return &item
 }
 
 func (q *query) itemArray(name string, c int) *query {
-	item := query{js: simplejson.NewArray(c), mode: _M_MULTI, nm: name, rt: q.rt, pr: q}
+	item := query{js: simplejson.NewArray(c), mode: _M_MULTI, name: name, req: q.req, parent: q}
 	q.itemAdd(name, item.js)
 	return &item
 }
 
 func (q *query) backByName(name string) (*query, bool) {
-	for q.nm != name && q.pr != nil {
-		q = q.pr
+	for q.name != name && q.parent != nil {
+		q = q.parent
 	}
-	if q.nm == name {
+	if q.name == name {
 		return q, true
 	}
 	return nil, false
 }
 
 func (q *query) Size(size int) Query {
-	q.rt.js.Set("size", size)
+	q.req.js.Set("size", size)
 	return q
 }
 
 func (q *query) From(from int) Query {
-	q.rt.js.Set("from", from)
+	q.req.js.Set("from", from)
 	return q
 }
 
@@ -383,7 +386,7 @@ func (q *query) Source(field ...string) Query {
 	for n := range field {
 		js.AddArray(field[n])
 	}
-	q.rt.js.Set("_source", js)
+	q.req.js.Set("_source", js)
 	return q
 }
 
@@ -469,11 +472,22 @@ func (q *query) Lt(val interface{}) Range {
 	return q
 }
 
+func (q *query) Format(format string) Range {
+	q.js.Set("format", format)
+	return q
+}
+
+func (q *query) TimeZone(val string) Range {
+	q.js.Set("time_zone", val)
+	return q
+}
+
 func (q *query) Sort(key string) Sort {
 	fn := "sort"
 	item, f := q.backByName(fn)
 	if !f {
-		item = q.itemArray(fn, 1)
+		item, _ = q.backByName("root")
+		item = item.itemArray(fn, 1)
 	}
 	return item.itemMap(key)
 }
