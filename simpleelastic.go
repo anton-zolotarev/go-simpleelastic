@@ -377,7 +377,7 @@ func (q *query) Do() (*Responce, error) {
 		if ind, err := js.GetPath("metadata", "indices").Map(); err == nil {
 			out.resp.total = len(ind)
 			for _, index := range ind {
-				if simplejson.New(index).Get("state").MustString() == "open" {
+				if simplejson.Wrap(index).Get("state").MustString() == "open" {
 					out.resp.len++
 				}
 			}
