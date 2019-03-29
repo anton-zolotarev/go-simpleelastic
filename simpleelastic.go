@@ -28,8 +28,10 @@ const (
 
 const (
 	_ACT_SEARCH action = iota + 1
+	_ACT_SCROLL
 	_ACT_INDEX_OPEN
 	_ACT_INDEX_CLOSE
+	_ACT_INDEX_CHECK
 )
 
 type Conn struct {
@@ -50,11 +52,10 @@ type query struct {
 type request struct {
 	method
 	action
-	scroll   *string
-	isscroll bool
-	limit    int
-	index    []string
-	conn     *Conn
+	scroll *string
+	limit  int
+	index  []string
+	conn   *Conn
 	query
 }
 
@@ -77,6 +78,7 @@ type RecGet interface {
 	Index(val ...string) RecGet
 	Scroll(val string, limit int) RecGet
 	Do() (*Responce, error)
+	DoRetry(timeout time.Duration, count int) (resp *Responce, err error)
 }
 
 type Query interface {
@@ -138,22 +140,32 @@ func (c *Conn) newRequest(mtd method, act action) *request {
 	return &req
 }
 
-func (c *Conn) indexAct(act action, val ...string) error {
-	rec := c.newRequest(_REQ_POST, _ACT_INDEX_OPEN)
-	rec.index = val
-	_, err := rec.Do()
-	if err != nil {
-		return err
+func (c *Conn) indexAct(act action, val ...string) (*Responce, error) {
+	if len(val) == 0 {
+		return nil, errors.New("indexAct error: empty index list")
 	}
-	return nil
+
+	mtd := _REQ_POST
+	if act == _ACT_INDEX_CHECK {
+		mtd = _REQ_GET
+	}
+	rec := c.newRequest(mtd, act)
+	rec.index = val
+	return rec.Do()
 }
 
 func (c *Conn) IndexOpen(val ...string) error {
-	return c.indexAct(_ACT_INDEX_OPEN, val...)
+	_, err := c.indexAct(_ACT_INDEX_OPEN, val...)
+	return err
 }
 
 func (c *Conn) IndexClose(val ...string) error {
-	return c.indexAct(_ACT_INDEX_CLOSE, val...)
+	_, err := c.indexAct(_ACT_INDEX_CLOSE, val...)
+	return err
+}
+
+func (c *Conn) IndexCheck(val ...string) (*Responce, error) {
+	return c.indexAct(_ACT_INDEX_CHECK, val...)
 }
 
 func (c *Conn) Get() RecGet {
@@ -189,9 +201,16 @@ func (r *Responce) Next() bool {
 			return true
 		}
 
+		if r.resp.req.conn.outlog != nil {
+			fmt.Fprintln(r.resp.req.conn.outlog,
+				"count:", r.resp.count,
+				"limit:", r.resp.req.limit,
+				"total:", r.resp.total,
+				"\n")
+		}
+
 		if r.resp.session != nil && r.resp.count < r.resp.total && r.resp.count < r.resp.req.limit {
-			rec := r.resp.req.conn.newRequest(r.resp.req.method, _ACT_SEARCH)
-			rec.isscroll = true
+			rec := r.resp.req.conn.newRequest(r.resp.req.method, _ACT_SCROLL)
 			rec.limit = r.resp.req.limit
 			rec.scroll = r.resp.req.scroll
 
@@ -226,7 +245,9 @@ func (rt *request) String() string {
 }
 
 func (rt *request) Index(val ...string) RecGet {
-	rt.index = val
+	if len(val) != 0 {
+		rt.index = val
+	}
 	return rt
 }
 
@@ -236,11 +257,29 @@ func (rt *request) Scroll(val string, limit int) RecGet {
 	return rt
 }
 
+func (q *query) DoRetry(timeout time.Duration, count int) (resp *Responce, err error) {
+	iter := 0
+	for {
+		resp, err = q.Do()
+		if err == nil || iter >= count {
+			return
+		}
+		time.Sleep(timeout)
+	}
+}
+
 func (q *query) Do() (*Responce, error) {
 	req := q.req
 	var url bytes.Buffer
+	var body bytes.Buffer
+
 	url.WriteString(req.conn.host)
-	if !req.isscroll {
+
+	if req.action == _ACT_INDEX_CHECK {
+		url.WriteString("/_cluster/state/metadata")
+	}
+
+	if req.action != _ACT_SCROLL {
 		url.WriteString("/")
 		url.WriteString(strings.Join(req.index, ","))
 	}
@@ -248,22 +287,20 @@ func (q *query) Do() (*Responce, error) {
 	switch req.action {
 	case _ACT_SEARCH:
 		url.WriteString("/_search")
+		if req.scroll != nil {
+			url.WriteString("?scroll=")
+			url.WriteString(*req.scroll)
+		}
+	case _ACT_SCROLL:
+		url.WriteString("/_search/scroll")
 	case _ACT_INDEX_OPEN:
 		url.WriteString("/_open")
 	case _ACT_INDEX_CLOSE:
 		url.WriteString("/_close")
 	}
 
-	if req.isscroll {
-		url.WriteString("/scroll")
-	} else if req.scroll != nil {
-		url.WriteString("?scroll=")
-		url.WriteString(*req.scroll)
-	}
-
-	var body bytes.Buffer
-	if req.action == _ACT_SEARCH {
-		data, _ := q.js.Encode()
+	if m, f := req.js.Map(); f == nil && len(m) > 0 {
+		data, _ := req.js.Encode()
 		body.Write(data)
 	}
 
@@ -324,11 +361,27 @@ func (q *query) Do() (*Responce, error) {
 		return nil, errors.New(str)
 	}
 
-	out := &Responce{resp: &responce{req: req, total: js.GetPath("hits", "total").MustInt(), hits: js.GetPath("hits", "hits")}}
-	out.resp.len = len(out.resp.hits.MustArray())
+	out := &Responce{resp: &responce{req: req}}
+	switch req.action {
+	case _ACT_SCROLL:
+		fallthrough
+	case _ACT_SEARCH:
+		out.resp.total = js.GetPath("hits", "total").MustInt()
+		out.resp.hits = js.GetPath("hits", "hits")
+		out.resp.len = len(out.resp.hits.MustArray())
 
-	if id, err := js.Get("_scroll_id").String(); err == nil {
-		out.resp.session = &id
+		if id, err := js.Get("_scroll_id").String(); err == nil {
+			out.resp.session = &id
+		}
+	case _ACT_INDEX_CHECK:
+		if ind, err := js.GetPath("metadata", "indices").Map(); err == nil {
+			out.resp.total = len(ind)
+			for _, index := range ind {
+				if simplejson.New(index).Get("state").MustString() == "open" {
+					out.resp.len++
+				}
+			}
+		}
 	}
 
 	return out, nil
