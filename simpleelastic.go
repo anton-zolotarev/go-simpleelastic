@@ -15,6 +15,7 @@ import (
 type method int
 type mode int
 type action int
+type group int
 
 const (
 	_REQ_GET method = iota + 1
@@ -34,6 +35,16 @@ const (
 	_ACT_INDEX_CHECK
 )
 
+const (
+	_GR_ROOT group = (1 << iota)
+	_GR_CHILD
+	_GR_QUERY
+	_GR_BOOL
+	_GR_COND
+	_GR_RANGE
+	_GR_SORT
+)
+
 type Conn struct {
 	host   string
 	inlog  io.Writer
@@ -43,6 +54,7 @@ type Conn struct {
 
 type query struct {
 	mode
+	group
 	name   string
 	js     *simplejson.Json
 	req    *request
@@ -85,21 +97,39 @@ type Query interface {
 	Size(size int) Query
 	From(from int) Query
 	Source(field ...string) Query
-	Term(key string, val ...interface{}) Query
-	Range(key string) Range
 	Sort(key string) Sort
-	Bool() Bool
-	BoolNstd() Bool
 
-	Query() Query
+	Cond
 }
 
 type Bool interface {
-	Must() Query
-	MustNot() Query
-	Should() Query
-	Filter() Query
-	BoolNstd() Bool
+	Must() Cond
+	MustNot() Cond
+	Should() Cond
+	Filter() Cond
+}
+
+type Term interface {
+	Cond
+	Bool
+}
+
+type Value interface {
+	Value(val interface{}) Value
+	Boost(val float32) Value
+}
+
+type Cond interface {
+	Term(key string, val ...interface{}) Term
+	Fuzzy(key string, val string) Term
+	Regexp(key string, val string) Term
+	Wildcard(key string, val string) Term
+	Exists(key string) Term
+	Range(key string) Range
+	Bool() Bool
+
+	BackQuery() Query
+	BackBool() Bool
 }
 
 type Range interface {
@@ -111,8 +141,9 @@ type Range interface {
 	TimeZone(val string) Range
 
 	Range(key string) Range
-	Bool() Bool
-	Query() Query
+
+	BackQuery() Query
+	BackBool() Bool
 }
 
 type Sort interface {
@@ -120,7 +151,8 @@ type Sort interface {
 	Mode(val string) Sort
 
 	Sort(key string) Sort
-	Query() Query
+
+	BackQuery() Query
 }
 
 func Open(host string) *Conn {
@@ -133,6 +165,7 @@ func (c *Conn) newRequest(mtd method, act action) *request {
 	req.method = mtd
 	req.action = act
 	req.mode = _M_SINGLE
+	req.group = _GR_ROOT
 	req.index = []string{"_all"}
 	req.js = simplejson.New()
 	req.query.name = "root"
@@ -265,6 +298,7 @@ func (q *query) DoRetry(timeout time.Duration, count int) (resp *Responce, err e
 			return
 		}
 		time.Sleep(timeout)
+		iter++
 	}
 }
 
@@ -402,14 +436,14 @@ func (q *query) itemAdd(key string, js *simplejson.Json) {
 	}
 }
 
-func (q *query) itemMap(name string) *query {
-	item := query{js: simplejson.New(), mode: _M_SINGLE, name: name, req: q.req, parent: q}
+func (q *query) itemMap(name string, gr group) *query {
+	item := query{js: simplejson.New(), mode: _M_SINGLE, group: gr, name: name, req: q.req, parent: q}
 	q.itemAdd(name, item.js)
 	return &item
 }
 
-func (q *query) itemArray(name string, c int) *query {
-	item := query{js: simplejson.NewArray(c), mode: _M_MULTI, name: name, req: q.req, parent: q}
+func (q *query) itemArray(name string, gr group, c int) *query {
+	item := query{js: simplejson.NewArray(c), mode: _M_MULTI, group: gr, name: name, req: q.req, parent: q}
 	q.itemAdd(name, item.js)
 	return &item
 }
@@ -419,6 +453,16 @@ func (q *query) backByName(name string) (*query, bool) {
 		q = q.parent
 	}
 	if q.name == name {
+		return q, true
+	}
+	return nil, false
+}
+
+func (q *query) backByGroup(gr group) (*query, bool) {
+	for q.group&gr == 0 && q.parent != nil {
+		q = q.parent
+	}
+	if q.group&gr > 0 {
 		return q, true
 	}
 	return nil, false
@@ -444,65 +488,117 @@ func (q *query) Source(field ...string) Query {
 }
 
 func (q *query) Query() Query {
-	fn := "query"
-	if item, f := q.backByName(fn); f {
+	return q.itemMap("query", _GR_QUERY)
+}
+
+func (q *query) BackQuery() Query {
+	if item, f := q.backByGroup(_GR_QUERY); f {
 		return item
 	}
-	return q.itemMap(fn)
+	return q.Query()
 }
 
 func (q *query) Bool() Bool {
-	fn := "bool"
-	if item, f := q.backByName(fn); f {
+	return q.itemMap("bool", _GR_BOOL)
+}
+
+func (q *query) BackBool() Bool {
+	if item, f := q.backByGroup(_GR_BOOL); f {
 		return item
 	}
-	return q.itemMap(fn)
+	return q.Bool()
 }
 
-func (q *query) BoolNstd() Bool {
-	fn := "bool"
-	return q.itemMap(fn)
+func (q *query) Must() Cond {
+	q, f := q.backByGroup(_GR_BOOL)
+	if !f {
+		// return q
+	}
+	return q.itemArray("must", _GR_COND, 1)
 }
 
-func (q *query) Must() Query {
-	return q.itemArray("must", 1)
+func (q *query) MustNot() Cond {
+	q, f := q.backByGroup(_GR_BOOL)
+	if !f {
+		return q
+	}
+	return q.itemArray("must_not", _GR_COND, 1)
 }
 
-func (q *query) MustNot() Query {
-	return q.itemArray("must_not", 1)
+func (q *query) Should() Cond {
+	q, f := q.backByGroup(_GR_BOOL)
+	if !f {
+		return q
+	}
+	return q.itemArray("should", _GR_COND, 1)
 }
 
-func (q *query) Should() Query {
-	return q.itemArray("should", 1)
+func (q *query) Filter() Cond {
+	q, f := q.backByGroup(_GR_BOOL)
+	if !f {
+		return q
+	}
+	return q.itemArray("filter", _GR_COND, 1)
 }
 
-func (q *query) Filter() Query {
-	return q.itemArray("filter", 1)
-}
-
-func (q *query) Term(key string, val ...interface{}) Query {
+func (q *query) Term(key string, val ...interface{}) Term {
+	fn := "term"
 	js := simplejson.New()
-
-	var fn string
-	if len(val) > 1 {
+	if len(val) == 1 {
+		js.Set(key, val[0])
+	} else {
 		fn = "terms"
 		js.Set(key, val)
-	} else {
-		fn = "term"
-		js.Set(key, val[0])
 	}
 
 	q.itemAdd(fn, js)
 	return q
 }
 
+func (q *query) Fuzzy(key string, val string) Term {
+	js := simplejson.New()
+	js.Set(key, val)
+	q.itemAdd("fuzzy", js)
+	return q
+}
+
+func (q *query) Regexp(key string, val string) Term {
+	js := simplejson.New()
+	js.Set(key, val)
+	q.itemAdd("regexp", js)
+	return q
+}
+
+func (q *query) Wildcard(key string, val string) Term {
+	js := simplejson.New()
+	js.Set(key, val)
+	q.itemAdd("wildcard", js)
+	return q
+}
+
+func (q *query) Exists(key string) Term {
+	js := simplejson.New()
+	js.Set("field", key)
+	q.itemAdd("exists", js)
+	return q
+}
+
+func (q *query) Value(val interface{}) Value {
+	q.js.Set("value", val)
+	return q
+}
+
+func (q *query) Boost(val float32) Value {
+	q.js.Set("boost", val)
+	return q
+}
+
 func (q *query) Range(key string) Range {
-	fn := "range"
-	item, f := q.backByName(fn)
-	if !f {
-		item = q.itemMap(fn)
+	item, f := q.backByGroup(_GR_RANGE | _GR_COND | _GR_QUERY)
+	if !f || item.group != _GR_RANGE {
+		item = item.itemMap("range", _GR_RANGE)
 	}
-	return item.itemMap(key)
+	return item.itemMap(key, _GR_CHILD)
 }
 
 func (q *query) Gte(val interface{}) Range {
@@ -536,13 +632,11 @@ func (q *query) TimeZone(val string) Range {
 }
 
 func (q *query) Sort(key string) Sort {
-	fn := "sort"
-	item, f := q.backByName(fn)
-	if !f {
-		item, _ = q.backByName("root")
-		item = item.itemArray(fn, 1)
+	item, f := q.backByGroup(_GR_SORT | _GR_ROOT)
+	if !f || item.group != _GR_SORT {
+		item = item.itemArray("sort", _GR_SORT, 1)
 	}
-	return item.itemMap(key)
+	return item.itemMap(key, _GR_CHILD)
 }
 
 func (q *query) Order(val string) Sort {
