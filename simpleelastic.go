@@ -46,10 +46,12 @@ const (
 )
 
 type Conn struct {
-	host   string
-	inlog  io.Writer
-	outlog io.Writer
-	errlog io.Writer
+	host    []string
+	timeout time.Duration
+	idxhst  int
+	inlog   io.Writer
+	outlog  io.Writer
+	errlog  io.Writer
 }
 
 type query struct {
@@ -155,7 +157,7 @@ type Sort interface {
 	BackQuery() Query
 }
 
-func Open(host string) *Conn {
+func Open(host ...string) *Conn {
 	return &Conn{host: host}
 }
 
@@ -215,6 +217,10 @@ func (c *Conn) SetOutLog(log io.Writer) {
 
 func (c *Conn) SetErrLog(log io.Writer) {
 	c.errlog = log
+}
+
+func (c *Conn) SetTimeout(timeout time.Duration) {
+	c.timeout = timeout
 }
 
 func (r *Responce) Total() int {
@@ -307,7 +313,9 @@ func (q *query) Do() (*Responce, error) {
 	var url bytes.Buffer
 	var body bytes.Buffer
 
-	url.WriteString(req.conn.host)
+	req.conn.idxhst++
+	host := req.conn.host[(req.conn.idxhst % len(req.conn.host))]
+	url.WriteString(host)
 
 	if req.action == _ACT_INDEX_CHECK {
 		url.WriteString("/_cluster/state/metadata")
@@ -351,7 +359,9 @@ func (q *query) Do() (*Responce, error) {
 		tp = "GET"
 	}
 
-	cl := &http.Client{}
+	cl := &http.Client{
+		Timeout: req.conn.timeout,
+	}
 	rhttp, err := http.NewRequest(tp, url.String(), &body)
 	if err != nil {
 		if req.conn.errlog != nil {
